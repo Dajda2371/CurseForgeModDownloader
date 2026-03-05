@@ -14,9 +14,10 @@ except ImportError:
     print("pip install selenium beautifulsoup4 webdriver-manager")
     exit(1)
 
-# Paths
-HTML_FILE = r"c:\Users\David\Downloads\Dračovňák\modlist.html"
-MODS_DIR = r"c:\Users\David\Downloads\Dračovňák\mods"
+# Paths — resolved relative to this script's location, works on any OS/user
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HTML_FILE = os.path.join(SCRIPT_DIR, "modlist.html")
+MODS_DIR = os.path.join(SCRIPT_DIR, "mods")
 
 def main():
     # Ensure mods directory exists
