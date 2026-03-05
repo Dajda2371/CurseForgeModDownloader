@@ -228,7 +228,7 @@ def main():
 
     print(f"\n→ Minecraft {mc_version} / {loader_name.capitalize()}\n")
 
-    mods_dir = os.path.join(MODS_DIR, mc_version)
+    mods_dir = MODS_DIR
     os.makedirs(mods_dir, exist_ok=True)
     mods_dir_abs = os.path.abspath(mods_dir)
 
