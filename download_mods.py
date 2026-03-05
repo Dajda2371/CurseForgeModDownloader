@@ -14,12 +14,11 @@ except ImportError:
     print("pip install selenium beautifulsoup4 webdriver-manager")
     exit(1)
 
-# Paths — resolved relative to this script's location, works on any OS/user
+# Paths — resolved relative to this script's location
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HTML_FILE = os.path.join(SCRIPT_DIR, "modlist.html")
 MODS_DIR = os.path.join(SCRIPT_DIR, "mods")
 
-# Mod loader name -> CurseForge gameVersionTypeId
 LOADERS = {
     "forge": 1,
     "fabric": 4,
@@ -28,7 +27,7 @@ LOADERS = {
 
 
 def wait_for_downloads(mods_dir, timeout=30):
-    """Wait until no .crdownload files remain (Chrome is done downloading)."""
+    """Wait until no .crdownload files remain (Chrome finished downloading)."""
     for _ in range(timeout):
         downloading = glob.glob(os.path.join(mods_dir, "*.crdownload"))
         if not downloading:
@@ -37,33 +36,143 @@ def wait_for_downloads(mods_dir, timeout=30):
     return False
 
 
-def find_first_file_link(driver):
+def download_mod(driver, mod_url, mc_version, loader_id, mods_dir):
     """
-    Use JavaScript to search ALL <a> elements on the page for one whose href
-    matches /minecraft/mc-mods/<slug>/files/<numeric-id>.
-    Returns the href string or None.
+    1. Navigate to the mod's version-filtered files page.
+    2. Click on the first file row to open its detail page.
+    3. Click the Download button on that page to trigger the download.
+    Returns True on success, False on failure.
     """
-    href = driver.execute_script("""
+    # Step 1: Go to the filtered files page
+    files_url = (
+        f"{mod_url.rstrip('/')}/files/all"
+        f"?page=1&pageSize=20&version={mc_version}"
+        f"&gameVersionTypeId={loader_id}&showAlphaFiles=hide"
+    )
+    print(f"  Opening files page...")
+    driver.get(files_url)
+    time.sleep(10)
+
+    # Step 2: Use JS to click the FIRST file row link to open the file detail page
+    clicked_href = driver.execute_script("""
         var links = document.querySelectorAll('a[href]');
         for (var i = 0; i < links.length; i++) {
             var h = links[i].getAttribute('href');
-            if (h && /\\/minecraft\\/mc-mods\\/.+\\/files\\/\\d+$/.test(h)) {
+            if (h && /\\/minecraft\\/mc-mods\\/.+\\/files\\/[0-9]+$/.test(h)) {
+                links[i].click();
                 return h;
             }
         }
         return null;
     """)
-    return href
+
+    if not clicked_href:
+        # Retry once after waiting more
+        time.sleep(5)
+        clicked_href = driver.execute_script("""
+            var links = document.querySelectorAll('a[href]');
+            for (var i = 0; i < links.length; i++) {
+                var h = links[i].getAttribute('href');
+                if (h && /\\/minecraft\\/mc-mods\\/.+\\/files\\/[0-9]+$/.test(h)) {
+                    links[i].click();
+                    return h;
+                }
+            }
+            return null;
+        """)
+
+    if not clicked_href:
+        print(f"  ⚠  No file rows found on the page.")
+        # Debug info
+        title = driver.title
+        url = driver.current_url
+        print(f"     Page: {title}")
+        print(f"     URL:  {url}")
+        # Check if "No Results" is on the page
+        has_no_results = driver.execute_script("""
+            return document.body.innerText.includes('No Results');
+        """)
+        if has_no_results:
+            print(f"     Page shows 'No Results' for this version/loader.")
+        return False
+
+    print(f"  ↳ Clicked file: {clicked_href}")
+
+    # Step 3: Wait for the file detail page to load
+    time.sleep(8)
+
+    # Step 4: Count files before download
+    files_before = set(os.listdir(mods_dir))
+
+    # Step 5: Click the Download button on the file detail page
+    # Look for a prominent download button/link
+    download_clicked = driver.execute_script("""
+        // Strategy 1: Look for a button/link with download-related class or text
+        var candidates = document.querySelectorAll('a[href*="/download"], button');
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var text = (el.textContent || el.innerText || '').trim().toLowerCase();
+            var href = el.getAttribute('href') || '';
+            // Match "Download" button but not "Downloads" count
+            if ((text === 'download' || text === 'download file' || 
+                 text.startsWith('download') && !text.includes('downloads')) &&
+                el.offsetParent !== null) {
+                el.click();
+                return 'clicked: ' + text;
+            }
+            // Match href pointing to /download/<id>
+            if (/\\/download\\/[0-9]+/.test(href) && el.offsetParent !== null) {
+                el.click();
+                return 'clicked href: ' + href;
+            }
+        }
+        
+        // Strategy 2: Look for any visible element containing just "Download"
+        var allEls = document.querySelectorAll('a, button, span');
+        for (var i = 0; i < allEls.length; i++) {
+            var el = allEls[i];
+            var text = (el.textContent || el.innerText || '').trim();
+            if (text === 'Download' && el.offsetParent !== null) {
+                el.click();
+                return 'clicked element: ' + el.tagName;
+            }
+        }
+        
+        return null;
+    """)
+
+    if not download_clicked:
+        print(f"  ⚠  Could not find Download button on file detail page.")
+        print(f"     URL: {driver.current_url}")
+        return False
+
+    print(f"  ⬇  {download_clicked}")
+
+    # Step 6: Wait for CurseForge's 5-second countdown + download
+    time.sleep(10)
+    wait_for_downloads(mods_dir, timeout=30)
+
+    # Step 7: Check if a new file appeared
+    files_after = set(os.listdir(mods_dir))
+    new_files = {f for f in (files_after - files_before) if not f.endswith(".crdownload")}
+
+    if new_files:
+        for f in new_files:
+            size_mb = os.path.getsize(os.path.join(mods_dir, f)) / (1024 * 1024)
+            print(f"  ✓  Saved: {f} ({size_mb:.2f} MB)")
+        return True
+    else:
+        # Might still be downloading, don't mark as failed yet
+        print(f"  ⏳ Download may still be in progress...")
+        return True  # optimistic
 
 
 def main():
-    # --- Ask the user for Minecraft version ---
     mc_version = input("Enter the Minecraft version (e.g. 1.20.1): ").strip()
     if not mc_version:
         print("No version entered. Exiting.")
         return
 
-    # --- Ask for mod loader ---
     print("\nAvailable mod loaders:")
     print("  1) Forge")
     print("  2) Fabric")
@@ -74,15 +183,12 @@ def main():
     loader_name = loader_map.get(loader_choice, "forge")
     loader_id = LOADERS[loader_name]
 
-    print(f"\n→ Minecraft {mc_version} / {loader_name.capitalize()} (gameVersionTypeId={loader_id})\n")
+    print(f"\n→ Minecraft {mc_version} / {loader_name.capitalize()}\n")
 
-    # Ensure mods directory exists (version-specific sub-folder)
     mods_dir = os.path.join(MODS_DIR, mc_version)
     os.makedirs(mods_dir, exist_ok=True)
-    # Chrome needs an absolute path with forward slashes or escaped backslashes
     mods_dir_abs = os.path.abspath(mods_dir)
 
-    # Read the HTML file
     if not os.path.exists(HTML_FILE):
         print(f"Error: {HTML_FILE} not found!")
         return
@@ -90,7 +196,6 @@ def main():
     with open(HTML_FILE, "r", encoding="utf-8") as f:
         html_content = f.read()
 
-    # Parse HTML for mod links
     soup = BeautifulSoup(html_content, "html.parser")
     mod_entries = [
         (a.get_text(strip=True), a["href"])
@@ -102,7 +207,7 @@ def main():
     if not mod_entries:
         return
 
-    # Setup Selenium with Chrome download configured
+    # Setup Chrome — with anti-detection flags
     print("Setting up Chrome driver...")
     options = Options()
     prefs = {
@@ -112,107 +217,52 @@ def main():
         "safebrowsing.enabled": True,
     }
     options.add_experimental_option("prefs", prefs)
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
-    # Use CDP to ensure downloads go to the right directory (most reliable method)
+    # Hide the webdriver flag from JS detection
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    # Configure download via CDP
     driver.execute_cdp_cmd("Page.setDownloadBehavior", {
         "behavior": "allow",
         "downloadPath": mods_dir_abs,
     })
 
-    # Warm up — visit CurseForge to pass Cloudflare
-    print("Warming up browser (Cloudflare check)...")
-    driver.get("https://www.curseforge.com/minecraft/mc-mods")
+    # Warm up — pass Cloudflare
+    print("Warming up browser (Cloudflare)...")
+    driver.get("https://www.curseforge.com")
     time.sleep(8)
 
-    succeeded = []
+    succeeded = 0
     failed = []
 
     for idx, (mod_name, mod_url) in enumerate(mod_entries, 1):
         print(f"\n[{idx}/{len(mod_entries)}] {mod_name}")
 
-        # Build the files-page URL with all required params
-        files_url = (
-            f"{mod_url.rstrip('/')}/files/all"
-            f"?page=1&pageSize=20&version={mc_version}"
-            f"&gameVersionTypeId={loader_id}&showAlphaFiles=hide"
-        )
-        print(f"  Opening: {files_url}")
-        driver.get(files_url)
-
-        # Wait for the page to render (simple sleep is more reliable than selectors)
-        time.sleep(8)
-
-        # Use JavaScript to find the first file link
-        file_href = find_first_file_link(driver)
-
-        if not file_href:
-            # Maybe the page hasn't loaded yet, wait a bit more
-            time.sleep(5)
-            file_href = find_first_file_link(driver)
-
-        if not file_href:
-            print(f"  ⚠  No files found for {mc_version}/{loader_name.capitalize()}.")
-            # Debug: print what the page title says
-            try:
-                title = driver.title
-                print(f"     Page title: {title}")
-            except:
-                pass
-            failed.append(mod_name)
-            continue
-
-        # Build the download page URL: replace /files/ with /download/
-        if file_href.startswith("http"):
-            download_url = file_href.replace("/files/", "/download/")
+        ok = download_mod(driver, mod_url, mc_version, loader_id, mods_dir_abs)
+        if ok:
+            succeeded += 1
         else:
-            download_url = "https://www.curseforge.com" + file_href.replace("/files/", "/download/")
-
-        print(f"  ↳ Navigating to: {download_url}")
-
-        # Count files before download to detect new ones
-        files_before = set(os.listdir(mods_dir))
-
-        driver.get(download_url)
-
-        # The download page has a 5-second countdown, then triggers the download.
-        # Wait for the countdown + download to complete.
-        time.sleep(10)
-
-        # Wait for Chrome to finish writing (.crdownload disappears)
-        wait_for_downloads(mods_dir, timeout=30)
-
-        # Check what new file appeared
-        files_after = set(os.listdir(mods_dir))
-        new_files = files_after - files_before
-        # Filter out .crdownload temp files
-        new_files = {f for f in new_files if not f.endswith(".crdownload")}
-
-        if new_files:
-            for f in new_files:
-                size_mb = os.path.getsize(os.path.join(mods_dir, f)) / (1024 * 1024)
-                print(f"  ✓  Downloaded: {f} ({size_mb:.2f} MB)")
-            succeeded.append(mod_name)
-        else:
-            print(f"  ⚠  Download might still be in progress or failed.")
             failed.append(mod_name)
 
-    # Final wait for any stragglers
-    print("\nWaiting for any remaining downloads to finish...")
-    wait_for_downloads(mods_dir, timeout=30)
+    # Final wait
+    print("\nWaiting for remaining downloads...")
+    wait_for_downloads(mods_dir_abs, timeout=30)
 
     driver.quit()
 
-    # Final report
-    all_files = [f for f in os.listdir(mods_dir) if not f.endswith(".crdownload")]
+    all_files = [f for f in os.listdir(mods_dir_abs)
+                 if not f.endswith(".crdownload")]
+
     print(f"\n{'='*50}")
-    print(f"✅ Downloaded {len(succeeded)}/{len(mod_entries)} mods")
-    print(f"   Folder: {mods_dir_abs}")
-    print(f"   Files in folder: {len(all_files)}")
+    print(f"✅ Done! {len(all_files)} file(s) in: {mods_dir_abs}")
 
     if failed:
-        print(f"\n⚠  {len(failed)} mod(s) had issues:")
+        print(f"\n⚠  {len(failed)} mod(s) had no files for {mc_version}/{loader_name.capitalize()}:")
         for name in failed:
             print(f"   - {name}")
 
